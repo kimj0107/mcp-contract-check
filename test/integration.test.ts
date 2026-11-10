@@ -94,3 +94,78 @@ test('offline diff fails closed on unknown schema changes and invalid snapshots'
   await writeFile(after, '{invalid');
   assert.equal((await run(['diff', before, after])).code, 2);
 });
+
+test('live check reports preserve JSON and gate codes without leaking schemas or server errors', { timeout: 15_000 }, async (t) => {
+  const directory = await temporary(t);
+  const baseline = join(directory, 'baseline.json');
+  const junit = join(directory, 'check.xml');
+  assert.equal((await run(['snapshot', '--out', baseline, '--', process.execPath, server])).code, 0);
+  const args = ['check', '--baseline', baseline];
+  const child = ['--', process.execPath, server, 'breaking'];
+  const plain = await run([...args, ...child]);
+  const reported = await run([...args, '--junit', junit, '--github-actions', ...child]);
+  assert.equal(reported.code, plain.code);
+  assert.equal(reported.stdout, plain.stdout);
+  assert.equal(reported.stderr, '::error title=MCP contract breaking%3A fetch::Tool was removed\n');
+  assert.match(await readFile(junit, 'utf8'), /failures="1"/);
+
+  const failedReport = join(directory, 'failed.xml');
+  const failure = await run([...args, '--junit', failedReport, '--github-actions', '--', process.execPath, server, 'error']);
+  assert.equal(failure.code, 2);
+  assert.equal(failure.stdout, '');
+  assert.doesNotMatch(failure.stderr, /fixture-sensitive|::error/);
+  assert.ok(!(await readdir(directory)).includes('failed.xml'));
+});
+
+test('offline reports preserve all verdicts and omit schema-derived paths and values', { timeout: 15_000 }, async (t) => {
+  const directory = await temporary(t);
+  const before = join(directory, 'before.json');
+  const after = join(directory, 'after.json');
+  const secret = 'schema-secret<&"%\r\n::error::injected';
+  const snapshot = (schema: object) => JSON.stringify({
+    format: 1, tools: [{ name: 'search', inputSchema: { type: 'object', ...schema } }],
+  });
+  await writeFile(before, snapshot({}));
+  const cases = [
+    { code: 0, schema: { description: secret }, findings: 0 },
+    { code: 1, schema: { required: [secret], properties: { [secret]: { const: secret } } }, findings: 2 },
+    { code: 3, schema: { [secret]: secret }, findings: 1 },
+  ];
+  for (const entry of cases) {
+    await writeFile(after, snapshot(entry.schema));
+    const junit = join(directory, `${entry.code}.xml`);
+    const plain = await run(['diff', before, after]);
+    const reported = await run(['diff', before, after, '--junit', junit, '--github-actions']);
+    assert.equal(reported.code, entry.code, reported.stderr);
+    assert.equal(reported.stdout, plain.stdout);
+    const xml = await readFile(junit, 'utf8');
+    assert.match(xml, new RegExp(`failures="${entry.findings}"`));
+    assert.doesNotMatch(xml + reported.stderr, /schema-secret|inputSchema|injected/);
+    assert.equal(reported.stderr.split('\n').filter(Boolean).length, entry.findings);
+    if (entry.code === 3) assert.match(reported.stderr, /^::warning /);
+  }
+});
+
+test('report errors fail explicitly and cannot overwrite inputs or existing report files', { timeout: 15_000 }, async (t) => {
+  const directory = await temporary(t);
+  const baseline = join(directory, 'baseline.json');
+  const contents = '{"format":1,"tools":[]}';
+  await writeFile(baseline, contents);
+  for (const flags of [
+    ['--junit', baseline],
+    ['--junit', join(directory, 'missing', 'report.xml')],
+    ['--junit'],
+    ['--junit', '--github-actions'],
+    ['--github-actions', '--github-actions'],
+    ['--junit', 'first.xml', '--junit', 'second.xml'],
+  ]) {
+    const result = await run(['diff', baseline, baseline, ...flags]);
+    assert.equal(result.code, 2, JSON.stringify(flags));
+    assert.equal(result.stdout, '');
+    assert.ok(JSON.parse(result.stderr).error);
+    assert.equal(await readFile(baseline, 'utf8'), contents);
+  }
+  const result = await run(['snapshot', '--out', join(directory, 'new.json'), '--github-actions', '--', process.execPath, server]);
+  assert.equal(result.code, 2);
+  assert.deepEqual(await readdir(directory), ['baseline.json']);
+});

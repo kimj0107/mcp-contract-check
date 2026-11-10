@@ -12,7 +12,7 @@ wrapper, MCP browser, or tool execution framework. No model or API key is needed
 
 Implemented: live stdio capture, legacy and modern protocol modes, bounded
 pagination, deterministic snapshots, conservative input-schema comparisons,
-machine-readable reports, CLI exit codes, deadlines, child-process cleanup,
+machine-readable reports, optional JUnit and GitHub Actions reports, CLI exit codes, deadlines, child-process cleanup,
 and atomic baseline publication. The npm artifact is prepared locally; this
 package has **not** been published to the npm registry.
 
@@ -81,7 +81,8 @@ a claim that the server is safe or its responses are correct.
 
 ## CLI and CI contract
 
-Output is JSON, except for `--help`.
+Stdout is JSON, except for `--help`. Optional GitHub Actions annotations use
+stderr; JUnit is written to an explicitly named file.
 
 | Exit code | Meaning |
 | --- | --- |
@@ -110,6 +111,46 @@ npm ci --ignore-scripts
 npm run build
 node dist/src/cli.js check --baseline contract.json -- node my-server.mjs
 ```
+
+### Optional CI reports
+
+Both `check` and offline `diff` accept `--junit <new-file.xml>` and
+`--github-actions`, independently or together:
+
+```powershell
+node dist/src/cli.js check --baseline contract.json --junit contract-results.xml --github-actions -- node my-server.mjs
+node dist/src/cli.js diff before.json after.json --junit diff-results.xml --github-actions
+npm run example:ci
+```
+
+These options preserve the existing JSON report and verdict exit codes.
+Breaking findings become GitHub `error` annotations; manual-review findings
+become `warning` annotations **but still exit 3**. Each finding, including
+manual review, is a failing JUnit testcase. A compatible result produces one
+passing testcase and no annotations. These are comparison reports, not a
+record of tool execution.
+
+Reports contain only tool names, severities, and fixed finding reasons.
+They omit schema paths (which can contain sensitive property names), schema
+values, added-tool lists, and server output. Tool names remain visible.
+XML attributes and workflow command data/properties are escaped; invalid XML
+characters are replaced. The existing JSON output is **not redacted further**:
+it still includes finding paths and added-tool names, so handle it accordingly.
+
+JUnit publication is atomic and refuses to overwrite an existing file,
+including an input snapshot. Use a fresh path for each invocation. A report
+write failure exits 2 with a JSON error, not a successful verdict; capture or
+validation failures also exit 2 and produce no comparison reports. No report
+directory is created automatically, and existing reports are never cleared
+on failure; consumers must not mistake an older file for a fresh result.
+
+The checked-in CI workflow runs `npm run example:ci`. That self-verifying,
+offline example creates temporary synthetic snapshots and asserts compatible
+(0), breaking (1), and manual-review (3) exits, unchanged JSON, JUnit counts,
+annotation levels, and schema-value omission. It fails on assertion errors
+and cleans up its temporary files. It does not connect to a server, invoke
+tools, or publish anything. For your real gate, run the `check` command above
+as a normal CI step without suppressing its nonzero exit.
 
 ## Library
 
@@ -160,7 +201,8 @@ npm run smoke:package
 Tests cover schema-direction mistakes, unknown keyword interactions,
 pagination, modern envelopes, legacy fallback, hanging servers, cleanup,
 secret-bearing provider errors, overwrite refusal, failed forced capture, CLI
-exit codes, and installed-consumer behavior. No benchmark or production
+exit codes, CI-report escaping/redaction, report write failures, and
+installed-consumer behavior. No benchmark or production
 adoption is claimed.
 
 This original project was developed with GitHub Copilot AI assistance.

@@ -16,6 +16,7 @@
     "test": "npm run build && node --test dist/test/*.test.js",
     "prepack": "npm run build",
     "demo": "npm run build && node dist/src/cli.js --help",
+    "example:ci": "npm run build && node scripts/ci-example.mjs",
     "smoke:package": "node scripts/consumer-smoke.mjs"
   },
   "dependencies": { "@modelcontextprotocol/client": "2.4.0" },

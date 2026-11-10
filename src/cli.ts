@@ -3,15 +3,19 @@ import { link, lstat, readFile, rename, stat, unlink, writeFile } from 'node:fs/
 import { randomUUID } from 'node:crypto';
 import { captureTools, type CaptureOptions } from './capture.js';
 import { canonical, compareSnapshots, parseSnapshot, type Snapshot } from './contract.js';
+import { renderGitHubAnnotations, renderJUnit } from './reports.js';
 
 const help = `mcp-contract-check: snapshot MCP tool inputs and detect contract drift
 
   mcp-contract-check snapshot --out contract.json [options] -- executable args...
   mcp-contract-check check --baseline contract.json [options] -- executable args...
-  mcp-contract-check diff before.json after.json
+  mcp-contract-check diff before.json after.json [report options]
 
 Options: --timeout <1..120000 ms>  --protocol legacy|auto|2026-07-28
          --force (snapshot only: explicitly replace an existing baseline)
+Reports (check/diff only): --junit <new-file.xml> --github-actions
+JSON stays on stdout; GitHub Actions annotations go to stderr.
+Reports omit schema paths and values. JUnit refuses to overwrite existing files.
 
 Exit codes: 0 compatible/snapshot saved; 1 potentially breaking;
             2 usage, transport, or invalid snapshot; 3 manual review required.
@@ -25,17 +29,46 @@ async function load(path: string): Promise<Snapshot> {
   catch { throw new Error('Invalid contract snapshot'); }
 }
 
+interface ReportOptions { junit?: string; githubActions: boolean }
+
+function extractReportOptions(args: string[]): { remaining: string[]; options: ReportOptions } {
+  const options: ReportOptions = { githubActions: false };
+  const remaining: string[] = [];
+  for (let index = 0; index < args.length; index++) {
+    const flag = args[index]!;
+    if (flag === '--github-actions') {
+      if (options.githubActions) throw new Error('Duplicate option');
+      options.githubActions = true;
+    } else if (flag === '--junit') {
+      if (options.junit !== undefined) throw new Error('Duplicate option');
+      const value = args[++index];
+      if (!value || value.startsWith('--') || value === '-') throw new Error('--junit requires a new file path');
+      options.junit = value;
+    } else {
+      remaining.push(flag);
+      // Preserve values of capture options, even if they look like report flags.
+      if (['--baseline', '--timeout', '--protocol'].includes(flag) && index + 1 < args.length) {
+        remaining.push(args[++index]!);
+      }
+    }
+  }
+  return { remaining, options };
+}
+
 async function main(args: string[]): Promise<number> {
   if (args.length === 0 || args[0] === '--help') { process.stdout.write(help); return 0; }
   const command = args.shift();
   if (command === 'diff') {
-    if (args.length !== 2) throw new Error('diff requires two snapshot paths');
-    return report(compareSnapshots(await load(args[0]!), await load(args[1]!)));
+    const { remaining, options } = extractReportOptions(args);
+    if (remaining.length !== 2) throw new Error('diff requires two snapshot paths');
+    return report(compareSnapshots(await load(remaining[0]!), await load(remaining[1]!)), options);
   }
   if (command !== 'snapshot' && command !== 'check') throw new Error('Unknown command; use --help');
   const separator = args.indexOf('--');
   if (separator < 0 || !args[separator + 1]) throw new Error('Supply a trusted executable after --');
-  const flags = args.slice(0, separator);
+  const { remaining: flags, options } = command === 'check'
+    ? extractReportOptions(args.slice(0, separator))
+    : { remaining: args.slice(0, separator), options: { githubActions: false } };
   const executable = args[separator + 1]!;
   const childArgs = args.slice(separator + 2);
   let target: string | undefined;
@@ -62,7 +95,7 @@ async function main(args: string[]): Promise<number> {
     catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
   }
   const snapshot = await captureTools({ command: executable, args: childArgs, timeoutMs, protocol });
-  if (before) return report(compareSnapshots(before, snapshot));
+  if (before) return report(compareSnapshots(before, snapshot), options);
   const temporary = `${target}.${randomUUID()}.tmp`;
   try {
     await writeFile(temporary, `${canonical(snapshot)}\n`, { flag: 'wx', mode: 0o600 });
@@ -79,8 +112,20 @@ async function main(args: string[]): Promise<number> {
   }
 }
 
-function report(result: ReturnType<typeof compareSnapshots>): number {
+async function report(result: ReturnType<typeof compareSnapshots>, options: ReportOptions): Promise<number> {
+  if (options.junit !== undefined) {
+    const temporary = `${options.junit}.${randomUUID()}.tmp`;
+    try {
+      await writeFile(temporary, renderJUnit(result), { flag: 'wx', mode: 0o600 });
+      await link(temporary, options.junit);
+    } finally {
+      await unlink(temporary).catch((error: NodeJS.ErrnoException) => {
+        if (error.code !== 'ENOENT') throw error;
+      });
+    }
+  }
   process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+  if (options.githubActions) process.stderr.write(renderGitHubAnnotations(result));
   return result.verdict === 'breaking' ? 1 : result.verdict === 'review' ? 3 : 0;
 }
 
